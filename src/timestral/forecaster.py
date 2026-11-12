@@ -31,6 +31,7 @@ from timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET, Timestra
 from timestral.scaler import advancing_block_frames, causal_patch_loc_scale, clamp_nonfinite
 
 ArrayLike = Tensor | np.ndarray
+BoundLike = ArrayLike | float | list[float] | tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,8 @@ class TimestralForecaster:
         categorical_known_covariates: ArrayLike | None = None,
         symmetric_averaging: bool = True,
         clip_nonnegative: bool = True,
+        lower_bounds: BoundLike | None = None,
+        upper_bounds: BoundLike | None = None,
     ) -> Forecast:
         """Forecast `prediction_length` steps after `context`.
 
@@ -191,12 +194,18 @@ class TimestralForecaster:
             symmetric_averaging: Average with the reflected forecast of `-context`, with every
                 covariate row negated too.
             clip_nonnegative: Clamp at 0 the series whose observed context is non-negative.
+            lower_bounds: Optional scalar, `(V,)`, or `(B, V)` lower physical bounds.
+            upper_bounds: Optional scalar, `(V,)`, or `(B, V)` upper physical bounds.
 
         Returns:
             A :class:`Forecast` with `quantiles` `(B, V, prediction_length, Q)`.
         """
         assert prediction_length >= 1, f"prediction_length must be >= 1, got {prediction_length}"
         inputs, mask = self._as_context(context, observation_mask)
+        lower = self._as_bounds(lower_bounds, inputs.shape[:2], "lower_bounds", float("-inf"))
+        upper = self._as_bounds(upper_bounds, inputs.shape[:2], "upper_bounds", float("inf"))
+        if (lower > upper).any():
+            raise ValueError("lower_bounds must be <= upper_bounds")
         b = inputs.shape[0]
         t = inputs.shape[-1]
         past = self._as_covariates(past_covariates, b, t, "past_covariates")
@@ -228,7 +237,25 @@ class TimestralForecaster:
         if clip_nonnegative:
             eligible = nonnegative_context(inputs, mask)
             quantiles = torch.where(eligible[..., None, None], quantiles.clamp_min(0), quantiles)
+        quantiles = quantiles.clamp(lower[..., None, None], upper[..., None, None])
         return Forecast(quantiles=quantiles, quantile_levels=self.quantile_levels)
+
+    def _as_bounds(self, values: BoundLike | None, shape: tuple[int, int], name: str, default: float) -> Tensor:
+        if values is None:
+            return torch.full(shape, default, dtype=torch.float32, device=self.device)
+        bounds = torch.as_tensor(values, dtype=torch.float32, device=self.device)
+        if bounds.isnan().any():
+            raise ValueError(f"{name} must not contain NaN")
+        if bounds.dim() == 0:
+            return bounds.expand(shape)
+        if bounds.dim() == 1 and bounds.shape[0] == shape[1]:
+            return bounds[None].expand(shape)
+        if tuple(bounds.shape) == shape:
+            return bounds
+        raise ValueError(
+            f"{name} must be a scalar, (V={shape[1]},), or "
+            f"(B={shape[0]}, V={shape[1]}), got {tuple(bounds.shape)}"
+        )
 
     def _as_context(self, context: ArrayLike, observation_mask: ArrayLike | None) -> tuple[Tensor, Tensor]:
         x = torch.as_tensor(context, dtype=torch.float32, device=self.device)

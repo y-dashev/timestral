@@ -81,6 +81,26 @@ forecast.quantile(0.9)     # (2, 1, 96)
 - The context is capped at the trained length (32768 steps); the most recent steps are kept.
 - Horizons longer than one decode block (32 patches = 1024 steps) are forecast block by
   block; each block's median is fed back as context.
+- `lower_bounds` and `upper_bounds` accept a scalar, `(variates,)`, or
+  `(series, variates)` array to enforce physical limits on the returned quantiles.
+
+For example, a three-variate water-quality series containing dissolved oxygen, pH, and
+temperature can use parameter-specific bounds:
+
+```python
+forecast = forecaster.forecast(
+    context,
+    prediction_length=96,
+    known_covariates=weather_and_calendar,
+    lower_bounds=[0.0, 0.0, -5.0],
+    upper_bounds=[25.0, 14.0, 40.0],
+    clip_nonnegative=False,
+)
+```
+
+Use locally justified bounds and evaluate forecasts with rolling-origin backtests against
+seasonal and persistence baselines. Forecasts complement field and laboratory measurements;
+they do not by themselves establish contamination, safety, attribution, or compliance.
 
 ### Loading options
 
