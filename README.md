@@ -73,6 +73,8 @@ forecast.quantiles.shape   # (2, 1, 96, 21): series, variates, horizon, quantile
 forecast.quantile_levels   # (0.01, 0.05, 0.1, ..., 0.9, 0.95, 0.99)
 forecast.median            # (2, 1, 96)
 forecast.quantile(0.9)     # (2, 1, 96)
+forecast.probability_above(10.0)  # (2, 1, 96): quantile-interpolated threshold risk
+forecast.probability_outside(6.5, 9.0)  # risk outside a locally justified safe range
 ```
 
 - `context` can be `(B, V, T)`, `(B, T)` (one variate per series) or `(T,)` (one series),
@@ -101,6 +103,34 @@ forecast = forecaster.forecast(
 Use locally justified bounds and evaluate forecasts with rolling-origin backtests against
 seasonal and persistence baselines. Forecasts complement field and laboratory measurements;
 they do not by themselves establish contamination, safety, attribution, or compliance.
+Threshold probabilities can support review queues, but should be calibrated on local held-out
+observations before alerting.
+
+### Water-quality covariates
+
+Keep measurements at their available precision: a sunshine duration such as
+`6.465972222222222` hours is a valid floating-point covariate and does not need rounding.
+Stack observations available at the forecast origin as past covariates:
+
+```python
+past = np.stack([sunshine_duration_hours, tsm, kd490], axis=1)
+
+forecast = forecaster.forecast(
+    water_quality_targets,
+    prediction_length=horizon,
+    past_covariates=past,
+    known_covariates=forecast_weather_and_calendar,
+    lower_bounds=physical_lower_bounds,
+    upper_bounds=physical_upper_bounds,
+    clip_nonnegative=False,
+)
+```
+
+Use TSM, Kd490, sunshine, rainfall, wind, discharge, and field observations as
+`past_covariates` when they are observed only through the forecast origin. Put them in
+`known_covariates` only when their future values come from a forecast issued at or before
+that origin. Align every source to one regular time grid, retain missing values as `NaN`,
+and include seasonal/calendar covariates.
 
 ### Loading options
 

@@ -32,6 +32,7 @@ from timestral.scaler import advancing_block_frames, causal_patch_loc_scale, cla
 
 ArrayLike = Tensor | np.ndarray
 BoundLike = ArrayLike | float | list[float] | tuple[float, ...]
+ThresholdLike = BoundLike
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,56 @@ class Forecast:
         if level not in self.quantile_levels:
             raise ValueError(f"level {level} is not one of {self.quantile_levels}")
         return self.quantiles[..., self.quantile_levels.index(level)]
+
+    def probability_below(self, threshold: ThresholdLike) -> Tensor:
+        """Approximate `P(value <= threshold)` between quantiles, capped at the outer levels."""
+        values = self._as_threshold(threshold)
+        indices = torch.searchsorted(
+            self.quantiles.contiguous(), values[..., None].contiguous(), right=True
+        ).squeeze(-1)
+        lower_indices = (indices - 1).clamp(0, len(self.quantile_levels) - 1)
+        upper_indices = indices.clamp(0, len(self.quantile_levels) - 1)
+        lower_values = self.quantiles.gather(-1, lower_indices[..., None]).squeeze(-1)
+        upper_values = self.quantiles.gather(-1, upper_indices[..., None]).squeeze(-1)
+        levels = self.quantiles.new_tensor(self.quantile_levels)
+        lower_levels = levels[lower_indices]
+        upper_levels = levels[upper_indices]
+        width = upper_values - lower_values
+        interpolated = lower_levels + (upper_levels - lower_levels) * (values - lower_values) / width.clamp_min(1e-12)
+        cdf = torch.where(width > 0, interpolated, upper_levels)
+        return torch.where(
+            indices == 0,
+            levels[0],
+            torch.where(indices == len(self.quantile_levels), levels[-1], cdf),
+        )
+
+    def probability_above(self, threshold: ThresholdLike) -> Tensor:
+        """Approximate `P(value > threshold)` between quantiles, capped at the outer levels."""
+        return 1.0 - self.probability_below(threshold)
+
+    def probability_outside(self, lower: ThresholdLike, upper: ThresholdLike) -> Tensor:
+        """Approximate `P(value <= lower or value > upper)` for a safe operating range."""
+        lower_values = self._as_threshold(lower)
+        upper_values = self._as_threshold(upper)
+        if (lower_values > upper_values).any():
+            raise ValueError("lower threshold must be <= upper threshold")
+        return (self.probability_below(lower_values) + self.probability_above(upper_values)).clamp_max(1.0)
+
+    def _as_threshold(self, threshold: ThresholdLike) -> Tensor:
+        values = torch.as_tensor(threshold, dtype=self.quantiles.dtype, device=self.quantiles.device)
+        shape = self.quantiles.shape[:-1]
+        if values.isnan().any():
+            raise ValueError("threshold must not contain NaN")
+        if values.dim() == 0:
+            return values.expand(shape)
+        if values.dim() == 1 and values.shape[0] == shape[1]:
+            return values[None, :, None].expand(shape)
+        if values.dim() == 2 and tuple(values.shape) == shape[:2]:
+            return values[..., None].expand(shape)
+        try:
+            return torch.broadcast_to(values, shape)
+        except RuntimeError as error:
+            raise ValueError(f"threshold must broadcast to (B={shape[0]}, V={shape[1]}, H={shape[2]})") from error
 
 
 def ffill_with_mask(inputs: Tensor, mask: Tensor) -> Tensor:
