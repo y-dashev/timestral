@@ -31,6 +31,8 @@ from timestral.model import ROLE_KNOWN_COV, ROLE_PAST_COV, ROLE_TARGET, Timestra
 from timestral.scaler import advancing_block_frames, causal_patch_loc_scale, clamp_nonfinite
 
 ArrayLike = Tensor | np.ndarray
+BoundLike = ArrayLike | float | list[float] | tuple[float, ...]
+ThresholdLike = BoundLike
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,56 @@ class Forecast:
         if level not in self.quantile_levels:
             raise ValueError(f"level {level} is not one of {self.quantile_levels}")
         return self.quantiles[..., self.quantile_levels.index(level)]
+
+    def probability_below(self, threshold: ThresholdLike) -> Tensor:
+        """Approximate `P(value <= threshold)` between quantiles, capped at the outer levels."""
+        values = self._as_threshold(threshold)
+        indices = torch.searchsorted(
+            self.quantiles.contiguous(), values[..., None].contiguous(), right=True
+        ).squeeze(-1)
+        lower_indices = (indices - 1).clamp(0, len(self.quantile_levels) - 1)
+        upper_indices = indices.clamp(0, len(self.quantile_levels) - 1)
+        lower_values = self.quantiles.gather(-1, lower_indices[..., None]).squeeze(-1)
+        upper_values = self.quantiles.gather(-1, upper_indices[..., None]).squeeze(-1)
+        levels = self.quantiles.new_tensor(self.quantile_levels)
+        lower_levels = levels[lower_indices]
+        upper_levels = levels[upper_indices]
+        width = upper_values - lower_values
+        interpolated = lower_levels + (upper_levels - lower_levels) * (values - lower_values) / width.clamp_min(1e-12)
+        cdf = torch.where(width > 0, interpolated, upper_levels)
+        return torch.where(
+            indices == 0,
+            levels[0],
+            torch.where(indices == len(self.quantile_levels), levels[-1], cdf),
+        )
+
+    def probability_above(self, threshold: ThresholdLike) -> Tensor:
+        """Approximate `P(value > threshold)` between quantiles, capped at the outer levels."""
+        return 1.0 - self.probability_below(threshold)
+
+    def probability_outside(self, lower: ThresholdLike, upper: ThresholdLike) -> Tensor:
+        """Approximate `P(value <= lower or value > upper)` for a safe operating range."""
+        lower_values = self._as_threshold(lower)
+        upper_values = self._as_threshold(upper)
+        if (lower_values > upper_values).any():
+            raise ValueError("lower threshold must be <= upper threshold")
+        return (self.probability_below(lower_values) + self.probability_above(upper_values)).clamp_max(1.0)
+
+    def _as_threshold(self, threshold: ThresholdLike) -> Tensor:
+        values = torch.as_tensor(threshold, dtype=self.quantiles.dtype, device=self.quantiles.device)
+        shape = self.quantiles.shape[:-1]
+        if values.isnan().any():
+            raise ValueError("threshold must not contain NaN")
+        if values.dim() == 0:
+            return values.expand(shape)
+        if values.dim() == 1 and values.shape[0] == shape[1]:
+            return values[None, :, None].expand(shape)
+        if values.dim() == 2 and tuple(values.shape) == shape[:2]:
+            return values[..., None].expand(shape)
+        try:
+            return torch.broadcast_to(values, shape)
+        except RuntimeError as error:
+            raise ValueError(f"threshold must broadcast to (B={shape[0]}, V={shape[1]}, H={shape[2]})") from error
 
 
 def ffill_with_mask(inputs: Tensor, mask: Tensor) -> Tensor:
@@ -169,6 +221,8 @@ class TimestralForecaster:
         categorical_known_covariates: ArrayLike | None = None,
         symmetric_averaging: bool = True,
         clip_nonnegative: bool = True,
+        lower_bounds: BoundLike | None = None,
+        upper_bounds: BoundLike | None = None,
     ) -> Forecast:
         """Forecast `prediction_length` steps after `context`.
 
@@ -191,12 +245,18 @@ class TimestralForecaster:
             symmetric_averaging: Average with the reflected forecast of `-context`, with every
                 covariate row negated too.
             clip_nonnegative: Clamp at 0 the series whose observed context is non-negative.
+            lower_bounds: Optional scalar, `(V,)`, or `(B, V)` lower physical bounds.
+            upper_bounds: Optional scalar, `(V,)`, or `(B, V)` upper physical bounds.
 
         Returns:
             A :class:`Forecast` with `quantiles` `(B, V, prediction_length, Q)`.
         """
         assert prediction_length >= 1, f"prediction_length must be >= 1, got {prediction_length}"
         inputs, mask = self._as_context(context, observation_mask)
+        lower = self._as_bounds(lower_bounds, inputs.shape[:2], "lower_bounds", float("-inf"))
+        upper = self._as_bounds(upper_bounds, inputs.shape[:2], "upper_bounds", float("inf"))
+        if (lower > upper).any():
+            raise ValueError("lower_bounds must be <= upper_bounds")
         b = inputs.shape[0]
         t = inputs.shape[-1]
         past = self._as_covariates(past_covariates, b, t, "past_covariates")
@@ -228,7 +288,25 @@ class TimestralForecaster:
         if clip_nonnegative:
             eligible = nonnegative_context(inputs, mask)
             quantiles = torch.where(eligible[..., None, None], quantiles.clamp_min(0), quantiles)
+        quantiles = quantiles.clamp(lower[..., None, None], upper[..., None, None])
         return Forecast(quantiles=quantiles, quantile_levels=self.quantile_levels)
+
+    def _as_bounds(self, values: BoundLike | None, shape: tuple[int, int], name: str, default: float) -> Tensor:
+        if values is None:
+            return torch.full(shape, default, dtype=torch.float32, device=self.device)
+        bounds = torch.as_tensor(values, dtype=torch.float32, device=self.device)
+        if bounds.isnan().any():
+            raise ValueError(f"{name} must not contain NaN")
+        if bounds.dim() == 0:
+            return bounds.expand(shape)
+        if bounds.dim() == 1 and bounds.shape[0] == shape[1]:
+            return bounds[None].expand(shape)
+        if tuple(bounds.shape) == shape:
+            return bounds
+        raise ValueError(
+            f"{name} must be a scalar, (V={shape[1]},), or "
+            f"(B={shape[0]}, V={shape[1]}), got {tuple(bounds.shape)}"
+        )
 
     def _as_context(self, context: ArrayLike, observation_mask: ArrayLike | None) -> tuple[Tensor, Tensor]:
         x = torch.as_tensor(context, dtype=torch.float32, device=self.device)

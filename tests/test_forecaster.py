@@ -63,6 +63,41 @@ def test_symmetric_averaging_is_odd_with_covariates() -> None:
     torch.testing.assert_close(neg, -pos.flip(-1), rtol=0, atol=0)
 
 
+def test_forecast_respects_per_variate_bounds() -> None:
+    fc = tiny_forecaster()
+    x = series(2, 3, 120)
+    out = fc.forecast(
+        x,
+        24,
+        lower_bounds=[0.0, 6.5, -5.0],
+        upper_bounds=[20.0, 9.5, 35.0],
+        clip_nonnegative=False,
+    ).quantiles
+
+    assert (out[:, 0] >= 0.0).all() and (out[:, 0] <= 20.0).all()
+    assert (out[:, 1] >= 6.5).all() and (out[:, 1] <= 9.5).all()
+    assert (out[:, 2] >= -5.0).all() and (out[:, 2] <= 35.0).all()
+
+
+def test_forecast_rejects_inverted_bounds() -> None:
+    fc = tiny_forecaster()
+    with pytest.raises(ValueError, match="lower_bounds must be <= upper_bounds"):
+        fc.forecast(series(1, 2, 120), 24, lower_bounds=[0.0, 10.0], upper_bounds=[20.0, 9.0])
+
+
+def test_forecast_threshold_probabilities_interpolate_quantiles() -> None:
+    quantiles = torch.tensor([[[[0.0, 10.0, 20.0]], [[5.0, 15.0, 25.0]]]])
+    forecast = Forecast(quantiles, (0.1, 0.5, 0.9))
+
+    torch.testing.assert_close(forecast.probability_below([15.0, 15.0]), torch.tensor([[[0.7], [0.5]]]))
+    torch.testing.assert_close(forecast.probability_above([15.0, 15.0]), torch.tensor([[[0.3], [0.5]]]))
+    torch.testing.assert_close(forecast.probability_above(30.0), torch.full((1, 2, 1), 0.1))
+    torch.testing.assert_close(forecast.probability_outside(5.0, 15.0), torch.tensor([[[0.6], [0.6]]]))
+
+    with pytest.raises(ValueError, match="lower threshold must be <= upper threshold"):
+        forecast.probability_outside(15.0, 5.0)
+
+
 def test_categorical_covariates_are_target_encoded() -> None:
     fc = tiny_forecaster()
     x = series(2, 1, 120, positive=True)
